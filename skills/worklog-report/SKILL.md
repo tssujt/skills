@@ -1,6 +1,6 @@
 ---
 name: worklog-report
-description: Generate worklog reports from Git commits, Claude Code sessions, and Cursor sessions with AI summary. Use for daily reports, weekly reports, and work summaries.
+description: Generate worklog reports from Git commits, Claude Code sessions, Codex sessions, and Cursor sessions with AI summary. Use for daily reports, weekly reports, and work summaries.
 disable-model-invocation: true
 argument-hint: "Generate this week's worklog for workspace"
 allowed-tools: "Bash(python3 *), Bash(git config *)"
@@ -52,7 +52,9 @@ python3 ${CLAUDE_SKILL_DIR}/scripts/collect.py \
    - Do NOT include specific times, only summarize the work
    - Output the summary directly without extra headings or prefixes
 
-7. Output the final report directly in the conversation:
+7. The raw report may include Git Commits, Claude Code Sessions, Codex Sessions, and Cursor Sessions sections depending on which sources have activity in the date range.
+
+8. Output the final report directly in the conversation:
    - Start with the title line from the raw report
    - Insert `## Summary\n\n{summary}\n` after the title
-   - Do NOT append the rest of the raw report content (Git Commits, Claude Code Sessions, Cursor Sessions sections)
+   - Do NOT append the rest of the raw report content (Git Commits, Claude Code Sessions, Codex Sessions, Cursor Sessions sections)

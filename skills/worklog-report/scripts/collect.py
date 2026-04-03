@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect worklog data from Git commits, Claude Code sessions, and Cursor sessions.
+"""Collect worklog data from Git commits, Claude Code sessions, Codex sessions, and Cursor sessions.
 
 Outputs raw Markdown to stdout (no summary). Zero external dependencies.
 
@@ -31,11 +31,13 @@ class Config:
     date_from: date
     date_until: date
     claude_projects_dir: Path = field(init=False)
+    codex_state_db: Path = field(init=False)
     cursor_storage_dir: Path = field(init=False)
 
     def __post_init__(self):
         home = Path.home()
         self.claude_projects_dir = home / ".claude" / "projects"
+        self.codex_state_db = home / ".codex" / "state_5.sqlite"
         self.cursor_storage_dir = (
             home / "Library" / "Application Support" / "Cursor" / "User" / "workspaceStorage"
         )
@@ -135,6 +137,13 @@ def _date_overlaps(created: datetime, modified: datetime, d_from: date, d_until:
     return created_date <= d_until and modified_date >= d_from
 
 
+def _parse_unix_seconds(ts: object) -> Optional[datetime]:
+    try:
+        return datetime.fromtimestamp(int(ts), tz=timezone.utc)
+    except (TypeError, ValueError, OSError):
+        return None
+
+
 def _extract_repo_name(project_path: str, workspace_prefix: str) -> str:
     relative = project_path
     if relative.startswith(workspace_prefix):
@@ -188,6 +197,66 @@ def collect_claude_sessions(config: Config) -> dict[str, list[ClaudeSession]]:
 
     for sessions in result.values():
         sessions.sort(key=lambda s: s.created)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Codex Sessions
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CodexSession:
+    title: str
+    cwd: str
+    created_at: datetime
+    updated_at: datetime
+    git_branch: Optional[str]
+
+
+def collect_codex_sessions(config: Config) -> dict[str, list[CodexSession]]:
+    result: dict[str, list[CodexSession]] = {}
+    db_path = config.codex_state_db
+    if not db_path.is_file():
+        return result
+
+    workspace_prefix = str(config.workspace_root)
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        rows = conn.execute(
+            "SELECT title, cwd, created_at, updated_at, git_branch FROM threads"
+        ).fetchall()
+        conn.close()
+    except (sqlite3.Error, OSError):
+        return result
+
+    for title, cwd, created_ts, updated_ts, git_branch in rows:
+        if not isinstance(cwd, str) or not cwd.startswith(workspace_prefix):
+            continue
+
+        created_at = _parse_unix_seconds(created_ts)
+        updated_at = _parse_unix_seconds(updated_ts)
+        if created_at is None or updated_at is None:
+            continue
+
+        if not _date_overlaps(created_at, updated_at, config.date_from, config.date_until):
+            continue
+
+        repo_name = _extract_repo_name(cwd, workspace_prefix)
+        if not repo_name:
+            continue
+
+        result.setdefault(repo_name, []).append(CodexSession(
+            title=title or "(untitled)",
+            cwd=cwd,
+            created_at=created_at,
+            updated_at=updated_at,
+            git_branch=git_branch,
+        ))
+
+    for sessions in result.values():
+        sessions.sort(key=lambda s: s.created_at)
 
     return result
 
@@ -304,6 +373,7 @@ def generate_report(
     config: Config,
     git_data: dict[str, list[GitCommit]],
     claude_data: dict[str, list[ClaudeSession]],
+    codex_data: dict[str, list[CodexSession]],
     cursor_data: dict[str, list[CursorSession]],
 ) -> str:
     lines: list[str] = []
@@ -339,6 +409,18 @@ def generate_report(
                 )
             lines.append("")
 
+    # Codex Sessions
+    if codex_data:
+        lines.append("## Codex Sessions\n")
+        for repo, sessions in sorted(codex_data.items()):
+            lines.append(f"### {repo}\n")
+            for s in sessions:
+                created = s.created_at.astimezone().strftime("%H:%M")
+                updated = s.updated_at.astimezone().strftime("%H:%M")
+                branch = f" [{s.git_branch}]" if s.git_branch else ""
+                lines.append(f"- {_truncate(s.title)}{branch} ({created} - {updated})")
+            lines.append("")
+
     # Cursor Sessions
     if cursor_data:
         lines.append("## Cursor Sessions\n")
@@ -356,7 +438,7 @@ def generate_report(
                 lines.append(f"- {mode}{_truncate(label)} ({time_range})")
             lines.append("")
 
-    if not git_data and not claude_data and not cursor_data:
+    if not git_data and not claude_data and not codex_data and not cursor_data:
         lines.append("*No activity found for the specified date range.*")
 
     return "\n".join(lines) + "\n"
@@ -368,7 +450,7 @@ def generate_report(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Collect worklog data from Git, Claude Code, and Cursor sessions."
+        description="Collect worklog data from Git, Claude Code, Codex, and Cursor sessions."
     )
     parser.add_argument("--workspace-root", required=True, help="Root directory containing git repos")
     parser.add_argument("--git-author", required=True, help="Git author name to filter commits")
@@ -407,9 +489,10 @@ def main():
 
     git_data = collect_git_commits(config)
     claude_data = collect_claude_sessions(config)
+    codex_data = collect_codex_sessions(config)
     cursor_data = collect_cursor_sessions(config)
 
-    report = generate_report(config, git_data, claude_data, cursor_data)
+    report = generate_report(config, git_data, claude_data, codex_data, cursor_data)
     sys.stdout.write(report)
 
 
