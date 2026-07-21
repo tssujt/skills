@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect worklog data from Git commits, Claude Code sessions, Codex sessions, and Cursor sessions.
+"""Collect worklog data from Git commits and coding-agent sessions.
 
 Outputs raw Markdown to stdout (no summary). Zero external dependencies.
 
@@ -32,12 +32,16 @@ class Config:
     date_until: date
     claude_projects_dir: Path = field(init=False)
     codex_state_db: Path = field(init=False)
+    kimi_code_home: Path = field(init=False)
     cursor_storage_dir: Path = field(init=False)
 
     def __post_init__(self):
         home = Path.home()
         self.claude_projects_dir = home / ".claude" / "projects"
         self.codex_state_db = home / ".codex" / "state_5.sqlite"
+        self.kimi_code_home = Path(
+            os.environ.get("KIMI_CODE_HOME", home / ".kimi-code")
+        ).expanduser()
         self.cursor_storage_dir = (
             home / "Library" / "Application Support" / "Cursor" / "User" / "workspaceStorage"
         )
@@ -262,6 +266,95 @@ def collect_codex_sessions(config: Config) -> dict[str, list[CodexSession]]:
 
 
 # ---------------------------------------------------------------------------
+# Kimi Code Sessions
+# ---------------------------------------------------------------------------
+
+@dataclass
+class KimiSession:
+    title: str
+    work_dir: str
+    created_at: datetime
+    updated_at: datetime
+
+
+def collect_kimi_sessions(config: Config) -> dict[str, list[KimiSession]]:
+    result: dict[str, list[KimiSession]] = {}
+    index_path = config.kimi_code_home / "session_index.jsonl"
+    if not index_path.is_file():
+        return result
+
+    workspace_prefix = str(config.workspace_root)
+    seen_sessions: set[str] = set()
+
+    try:
+        index_lines = index_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return result
+
+    for line in index_lines:
+        try:
+            entry = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(entry, dict):
+            continue
+
+        session_dir_value = entry.get("sessionDir")
+        if not isinstance(session_dir_value, str) or not session_dir_value:
+            continue
+
+        session_dir = Path(session_dir_value).expanduser()
+        if not session_dir.is_absolute():
+            session_dir = config.kimi_code_home / session_dir
+
+        state_path = session_dir / "state.json"
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if not isinstance(state, dict):
+            continue
+
+        work_dir = entry.get("workDir") or state.get("workDir")
+        if not isinstance(work_dir, str) or not work_dir.startswith(workspace_prefix):
+            continue
+
+        created_at = _parse_iso(state.get("createdAt", ""))
+        if created_at is None:
+            continue
+        updated_at = _parse_iso(state.get("updatedAt", "")) or created_at
+        if not _date_overlaps(
+            created_at, updated_at, config.date_from, config.date_until
+        ):
+            continue
+
+        session_key = str(entry.get("sessionId") or session_dir)
+        if session_key in seen_sessions:
+            continue
+        seen_sessions.add(session_key)
+
+        repo_name = _extract_repo_name(work_dir, workspace_prefix)
+        if not repo_name:
+            continue
+
+        title = state.get("title") or state.get("lastPrompt") or "(untitled)"
+        if not isinstance(title, str):
+            title = "(untitled)"
+
+        result.setdefault(repo_name, []).append(KimiSession(
+            title=title,
+            work_dir=work_dir,
+            created_at=created_at,
+            updated_at=updated_at,
+        ))
+
+    for sessions in result.values():
+        sessions.sort(key=lambda s: s.created_at)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Cursor Sessions
 # ---------------------------------------------------------------------------
 
@@ -374,6 +467,7 @@ def generate_report(
     git_data: dict[str, list[GitCommit]],
     claude_data: dict[str, list[ClaudeSession]],
     codex_data: dict[str, list[CodexSession]],
+    kimi_data: dict[str, list[KimiSession]],
     cursor_data: dict[str, list[CursorSession]],
 ) -> str:
     lines: list[str] = []
@@ -421,6 +515,17 @@ def generate_report(
                 lines.append(f"- {_truncate(s.title)}{branch} ({created} - {updated})")
             lines.append("")
 
+    # Kimi Code Sessions
+    if kimi_data:
+        lines.append("## Kimi Code Sessions\n")
+        for repo, sessions in sorted(kimi_data.items()):
+            lines.append(f"### {repo}\n")
+            for s in sessions:
+                created = s.created_at.astimezone().strftime("%H:%M")
+                updated = s.updated_at.astimezone().strftime("%H:%M")
+                lines.append(f"- {_truncate(s.title)} ({created} - {updated})")
+            lines.append("")
+
     # Cursor Sessions
     if cursor_data:
         lines.append("## Cursor Sessions\n")
@@ -438,7 +543,7 @@ def generate_report(
                 lines.append(f"- {mode}{_truncate(label)} ({time_range})")
             lines.append("")
 
-    if not git_data and not claude_data and not codex_data and not cursor_data:
+    if not git_data and not claude_data and not codex_data and not kimi_data and not cursor_data:
         lines.append("*No activity found for the specified date range.*")
 
     return "\n".join(lines) + "\n"
@@ -450,7 +555,10 @@ def generate_report(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Collect worklog data from Git, Claude Code, Codex, and Cursor sessions."
+        description=(
+            "Collect worklog data from Git, Claude Code, Codex, Kimi Code, "
+            "and Cursor sessions."
+        )
     )
     parser.add_argument("--workspace-root", required=True, help="Root directory containing git repos")
     parser.add_argument("--git-author", required=True, help="Git author name to filter commits")
@@ -490,9 +598,12 @@ def main():
     git_data = collect_git_commits(config)
     claude_data = collect_claude_sessions(config)
     codex_data = collect_codex_sessions(config)
+    kimi_data = collect_kimi_sessions(config)
     cursor_data = collect_cursor_sessions(config)
 
-    report = generate_report(config, git_data, claude_data, codex_data, cursor_data)
+    report = generate_report(
+        config, git_data, claude_data, codex_data, kimi_data, cursor_data
+    )
     sys.stdout.write(report)
 
 
